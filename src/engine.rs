@@ -58,6 +58,11 @@ const GRACE: Duration = Duration::from_secs(5);
 const AUDIO_HOLD: Duration = Duration::from_secs(30);
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
 const APPS_SCAN_EVERY: Duration = Duration::from_secs(3);
+/// RAM counts as "low" when Windows has less than this share of it available.
+/// Only then do we push dozing apps' memory out: with plenty free, trimming
+/// gains nothing and just makes switching back slower (the app has to page
+/// its memory back in).
+const LOW_MEMORY_AVAILABLE: f64 = 0.30;
 /// Keep the app you just copied from awake this long, so pasting from it works.
 const CLIPBOARD_HOLD: Duration = Duration::from_secs(60);
 
@@ -675,7 +680,7 @@ impl Engine {
                     shared::repaint_ui();
                 }
                 Command::FreezeNow(exe) => {
-                    let trim = cfg.rule(&exe).map(|r| r.trim).unwrap_or(true);
+                    let trim = cfg.rule(&exe).map(|r| r.trim).unwrap_or(true) && memory_low();
                     let rt = self.rt.entry(exe.clone()).or_default();
                     match freezer::freeze_group(&exe, &group_of(&exe), trim) {
                         Ok(_) => rt.last_error = None,
@@ -720,17 +725,34 @@ impl Engine {
         }
         self.rt.retain(|exe, _| rule_exes.contains(exe));
 
+        // RAM got tight after some apps dozed: push out the memory of the one
+        // that's been asleep longest (one per tick to spread the disk work).
+        if memory_low() {
+            let oldest_untrimmed = freezer::frozen_info()
+                .into_iter()
+                .filter(|f| !f.trimmed && cfg.rule(&f.exe).is_some_and(|r| r.trim))
+                .min_by_key(|f| f.since);
+            if let Some(f) = oldest_untrimmed {
+                logln!("RAM is low; freeing memory of {}, which is already dozing", f.exe);
+                freezer::trim_dozing(&f.exe);
+            }
+        }
+
         if self.last_apps_scan.is_none_or(|t| now - t >= APPS_SCAN_EVERY) {
             self.last_apps_scan = Some(now);
             self.apps_cache = scan_apps(&tree, &windows, &excluded, &rule_exes);
         }
 
         let frozen_now = freezer::frozen_info();
+        let (system_total, system_available) = win::system_memory().unwrap_or((0, 0));
         shared::shared().status = Status {
             apps: self.apps_cache.clone(),
             rules: statuses,
             total_saved_bytes: frozen_now.iter().map(|f| f.saved_bytes).sum(),
             frozen_count: frozen_now.len(),
+            system_total,
+            system_available,
+            memory_low: memory_low(),
         };
     }
 
@@ -762,7 +784,11 @@ impl Engine {
                 shared::repaint_ui();
             } else {
                 return RuleStatus {
-                    state: RuleState::Frozen { for_secs: f.since.elapsed().as_secs(), saved_bytes: f.saved_bytes },
+                    state: RuleState::Frozen {
+                        for_secs: f.since.elapsed().as_secs(),
+                        saved_bytes: f.saved_bytes,
+                        trimmed: f.trimmed,
+                    },
                     procs: f.procs,
                     mem_bytes: measure(group).0,
                     cpu_percent: 0.0,
@@ -819,7 +845,8 @@ impl Engine {
             return status(RuleState::Counting(delay - elapsed));
         }
 
-        match freezer::freeze_group(&rule.exe, group, rule.trim) {
+        let trim = rule.trim && memory_low();
+        match freezer::freeze_group(&rule.exe, group, trim) {
             Ok(saved) => {
                 rt.last_error = None;
                 rt.retry_after = None;
@@ -830,7 +857,7 @@ impl Engine {
                     return status(RuleState::Waiting("In use".into()));
                 }
                 shared::repaint_ui();
-                status(RuleState::Frozen { for_secs: 0, saved_bytes: saved })
+                status(RuleState::Frozen { for_secs: 0, saved_bytes: saved, trimmed: trim })
             }
             Err(e) => {
                 logln!("could not doze {}: {e}", rule.exe);
@@ -887,17 +914,25 @@ fn condition(
     Ok(())
 }
 
-/// (working set bytes, total CPU time in 100ns) summed over the group.
+/// (private memory bytes, total CPU time in 100ns) summed over the group.
 fn measure(group: &[u32]) -> (u64, u64) {
     let mut mem = 0;
     let mut cpu = 0;
     for &pid in group {
         if let Ok(h) = win::open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
-            mem += win::working_set_bytes(&h).unwrap_or(0);
+            mem += win::private_memory_bytes(&h).unwrap_or(0);
             cpu += win::process_times(&h).map(|t| t.1).unwrap_or(0);
         }
     }
     (mem, cpu)
+}
+
+/// Is Windows short on RAM right now?
+fn memory_low() -> bool {
+    match win::system_memory() {
+        Some((total, avail)) if total > 0 => (avail as f64) < total as f64 * LOW_MEMORY_AVAILABLE,
+        _ => true, // can't tell: behave as before and free memory
+    }
 }
 
 fn scan_apps(

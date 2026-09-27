@@ -10,7 +10,10 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows::Win32::System::ProcessStatus::{
+    EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+};
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::Threading::{
@@ -86,11 +89,30 @@ pub fn process_times(h: &OwnedHandle) -> Option<(u64, u64)> {
     Some((filetime_u64(c), filetime_u64(k) + filetime_u64(u)))
 }
 
-pub fn working_set_bytes(h: &OwnedHandle) -> Option<u64> {
-    let mut pmc = PROCESS_MEMORY_COUNTERS::default();
+/// RAM used by this process alone: its *private* working set, the number
+/// Task Manager shows. The plain working set also counts pages shared with
+/// other processes (DLLs etc.), which stay in RAM whatever we do, so using it
+/// would overstate what dozing frees.
+pub fn private_memory_bytes(h: &OwnedHandle) -> Option<u64> {
+    let mut pmc = PROCESS_MEMORY_COUNTERS_EX2::default();
+    let cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(h.0, &mut pmc as *mut _ as *mut PROCESS_MEMORY_COUNTERS, cb).is_ok() };
+    if ok && pmc.PrivateWorkingSetSize > 0 {
+        return Some(pmc.PrivateWorkingSetSize as u64);
+    }
+    // Windows older than 10 1809 doesn't have the private figure.
+    let mut basic = PROCESS_MEMORY_COUNTERS::default();
     let cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-    unsafe { GetProcessMemoryInfo(h.0, &mut pmc, cb).ok()? };
-    Some(pmc.WorkingSetSize as u64)
+    unsafe { GetProcessMemoryInfo(h.0, &mut basic, cb).ok()? };
+    Some(basic.WorkingSetSize as u64)
+}
+
+/// (total, available) physical RAM in bytes, as Windows reports it.
+/// "Available" is what apps can actually get without anything being paged out.
+pub fn system_memory() -> Option<(u64, u64)> {
+    let mut m = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+    unsafe { GlobalMemoryStatusEx(&mut m).ok()? };
+    Some((m.ullTotalPhys, m.ullAvailPhys))
 }
 
 pub fn is_running(h: &OwnedHandle) -> bool {

@@ -33,8 +33,11 @@ pub struct FrozenGroup {
     pub exe: String,
     procs: Vec<FrozenProc>,
     pub since: Instant,
-    /// Working-set bytes released by trimming (0 if trimming was off).
+    /// Private memory released by trimming (0 if not trimmed yet).
     pub saved_bytes: u64,
+    /// Whether its memory has been pushed out of RAM yet. We only do that when
+    /// RAM is actually tight; otherwise it stays put so waking is instant.
+    pub trimmed: bool,
 }
 
 impl FrozenGroup {
@@ -67,6 +70,7 @@ pub struct FrozenInfo {
     pub exe: String,
     pub since: Instant,
     pub saved_bytes: u64,
+    pub trimmed: bool,
     pub procs: usize,
     pub pids: HashSet<u32>,
 }
@@ -78,6 +82,7 @@ pub fn frozen_info() -> Vec<FrozenInfo> {
             exe: g.exe.clone(),
             since: g.since,
             saved_bytes: g.saved_bytes,
+            trimmed: g.trimmed,
             procs: g.proc_count(),
             pids: g.pids().collect(),
         })
@@ -133,25 +138,55 @@ pub fn freeze_group(exe: &str, pids: &[u32], trim: bool) -> Result<u64, String> 
         }
     }
 
-    // 4. Threads can't run now, so trimmed pages won't be faulted straight back in.
-    let mut saved = 0u64;
+    let mut group = FrozenGroup { exe: exe.to_string(), procs, since: Instant::now(), saved_bytes: 0, trimmed: false };
+    logln!("dozed {exe}: {} processes", group.procs.len());
     if trim {
-        for p in &procs {
-            let before = win::working_set_bytes(&p.handle).unwrap_or(0);
-            win::empty_working_set(&p.handle);
-            let after = win::working_set_bytes(&p.handle).unwrap_or(before);
-            saved += before.saturating_sub(after);
-        }
+        trim_group(&mut group);
     }
-
-    logln!(
-        "dozed {exe}: {} processes, trimmed {:.0} MB",
-        procs.len(),
-        saved as f64 / 1_048_576.0
-    );
-    frozen.push(FrozenGroup { exe: exe.to_string(), procs, since: Instant::now(), saved_bytes: saved });
+    let saved = group.saved_bytes;
+    frozen.push(group);
     update_flag(&frozen);
     Ok(saved)
+}
+
+/// Push a dozing app's private memory out of RAM (to compressed memory or
+/// the pagefile). Its threads are suspended, so nothing can pull it back in
+/// until it wakes: this is what makes the RAM genuinely available to other apps.
+fn trim_group(g: &mut FrozenGroup) {
+    let avail_before = win::system_memory().map(|m| m.1);
+    let mut saved = 0u64;
+    let mut failed = 0;
+    for p in &g.procs {
+        let before = win::private_memory_bytes(&p.handle).unwrap_or(0);
+        if !win::empty_working_set(&p.handle) {
+            failed += 1;
+            continue;
+        }
+        let after = win::private_memory_bytes(&p.handle).unwrap_or(before);
+        saved += before.saturating_sub(after);
+    }
+    g.saved_bytes += saved;
+    g.trimmed = true;
+    let avail_after = win::system_memory().map(|m| m.1);
+    let mb = |b: u64| b as f64 / 1_048_576.0;
+    logln!(
+        "trimmed {}: released {:.0} MB of private memory{}; Windows available RAM {} -> {} MB (keeps rising for a few seconds as Windows compresses/writes the pages)",
+        g.exe,
+        mb(saved),
+        if failed > 0 { format!(" ({failed} process(es) refused)") } else { String::new() },
+        avail_before.map(|b| format!("{:.0}", mb(b))).unwrap_or("?".into()),
+        avail_after.map(|b| format!("{:.0}", mb(b))).unwrap_or("?".into()),
+    );
+}
+
+/// Trim an app that's already dozing (used when RAM gets tight after it dozed).
+/// Returns bytes released, or None if it isn't dozing or was already trimmed.
+pub fn trim_dozing(exe: &str) -> Option<u64> {
+    let mut frozen = lock();
+    let g = frozen.iter_mut().find(|g| g.exe == exe && !g.trimmed)?;
+    let before = g.saved_bytes;
+    trim_group(g);
+    Some(g.saved_bytes - before)
 }
 
 fn resume_group(g: &FrozenGroup) {

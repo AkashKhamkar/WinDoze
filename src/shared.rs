@@ -15,7 +15,8 @@ pub enum RuleState {
     Waiting(String),
     /// Condition met; will freeze when the countdown reaches zero.
     Counting(Duration),
-    Frozen { for_secs: u64, saved_bytes: u64 },
+    /// `trimmed`: its memory has been pushed out of RAM (only done when RAM is low).
+    Frozen { for_secs: u64, saved_bytes: u64, trimmed: bool },
     /// Freeze failed; retrying later.
     Error(String),
 }
@@ -43,6 +44,10 @@ pub struct Status {
     pub rules: HashMap<String, RuleStatus>,
     pub total_saved_bytes: u64,
     pub frozen_count: usize,
+    /// Physical RAM, and how much of it Windows says is available right now.
+    pub system_total: u64,
+    pub system_available: u64,
+    pub memory_low: bool,
 }
 
 pub enum Command {

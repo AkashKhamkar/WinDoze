@@ -14,7 +14,11 @@ For example, with Figma and Slack both added: work in Figma, Alt-Tab to Slack, a
 
 Each app can also wait a few minutes before dozing. The default, `0 min`, means "after 5 seconds", so a quick Alt-Tab back and forth never dozes anything.
 
-Switching back to a dozing app wakes it: click its taskbar button or thumbnail, Alt-Tab to it, or click its window. Under the hood, dozing means all of the app's processes are suspended. Optionally, WinDoze also pushes a dozing app's memory out of RAM ("Free its memory"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail.
+Switching back to a dozing app wakes it: click its taskbar button or thumbnail, Alt-Tab to it, or click its window. Under the hood, dozing means all of the app's processes are suspended. It stops using CPU and stops touching its memory, so Windows can hand that memory to the app you're using instead of thrashing the disk.
+
+When RAM runs low (under 30% available), WinDoze also pushes dozing apps' memory out of RAM ("Free its memory when RAM is low"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail. With plenty of RAM free, the memory stays put, because pushing it out would gain nothing and would only make switching back slower.
+
+The header shows **RAM available**: Windows' own figure for what your apps can use. It's the honest way to see WinDoze working.
 
 Only apps that are open show up on the home screen. When you close an app, WinDoze keeps its settings and tucks it into a **Not running** list, and it comes back with the same settings the next time you open it. Each app also has a **Force quit** button (with an "are you sure?") for when something gets stuck.
 
@@ -65,7 +69,7 @@ CI (`.github/workflows/build.yml`) builds the exe on `windows-latest` and upload
 Use a real Windows PC. A VM is fine for checking basics, but its memory behaviour won't match an 8 GB laptop, and some VMs lack OpenGL (you'll get an error box).
 
 1. Open Figma and Slack (or any two apps). In WinDoze, click **Add** next to both. New apps default to **When I switch away**, **0 min**.
-2. Click into Figma, then Alt-Tab to Slack. Within ~5 s Figma's status turns **Dozing** and shows the memory freed. In Task Manager → Details, its processes show **Suspended**.
+2. Click into Figma, then Alt-Tab to Slack. Within ~5 s Figma's status turns **Dozing** (with "memory kept" if RAM isn't low, or how much was released if it is). In Task Manager → Details, its processes show **Suspended**.
 3. Click Figma on the taskbar. It should wake and come to the front right away, and Slack starts its 5 s countdown.
 4. Let it doze again, then check the other ways back in:
    - hover over its taskbar button and click the thumbnail
@@ -84,7 +88,8 @@ Use a real Windows PC. A VM is fine for checking basics, but its memory behaviou
 - **Unidentified taskbar clicks wake everything.** If you click a running app's taskbar button, WinDoze can't tell which app it is, and nothing opens within 0.7 s, it wakes all dozing apps. That's deliberate: it's better than leaving you stuck. This safety net recognises English taskbar buttons ("… running window"); name matching works in any language.
 - **No waking from notifications or the tray.** A dozing app's notifications, tray icon and background sync don't work until it's woken. Apps with no open window never doze for this reason.
 - **Editor terminals can stall.** When an editor like Cursor or VS Code is dozing, its terminal's shell and dev server keep running, but the editor's own process reads their output. A process that prints a lot (e.g. a verbose build or dev-server logs) will block once the output buffer fills, until you switch back to the editor. For long builds, use **When minimized** with a longer delay, or leave the editor out.
-- **Freed memory isn't new memory.** It goes to Windows' compressed memory or the pagefile. Switching back to an app whose memory went to disk can take a second or two.
+- **Released memory isn't new memory.** It goes to Windows' compressed memory (still in RAM, but a fraction of the size) or the pagefile. The "released" number is the app's private memory that left RAM. The real gain shows up in **RAM available**, which keeps rising for a few seconds after a release. Switching back to an app whose memory went to disk can take a second or two.
+- **GPU memory isn't released.** Graphics memory held by an app's GPU process stays allocated while it dozes.
 
 ## Credits
 

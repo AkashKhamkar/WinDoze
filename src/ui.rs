@@ -142,7 +142,12 @@ impl eframe::App for WinDozeApp {
         let mut commands: Vec<Command> = Vec::new();
 
         if let Some(tray) = &self.tray {
-            let tip = format!("WinDoze: {} dozing, {} freed", status.frozen_count, fmt_bytes(status.total_saved_bytes));
+            let tip = format!(
+                "WinDoze: {} dozing, {} released. {} RAM available",
+                status.frozen_count,
+                fmt_bytes(status.total_saved_bytes),
+                fmt_bytes(status.system_available)
+            );
             let _ = tray.set_tooltip(Some(tip));
         }
 
@@ -168,11 +173,30 @@ impl eframe::App for WinDozeApp {
             ui.horizontal(|ui| {
                 ui.label(state);
                 ui.label(format!(
-                    "·  {} app(s) dozing  ·  {} of RAM freed",
+                    "·  {} app(s) dozing  ·  {} released from dozing apps",
                     status.frozen_count,
                     fmt_bytes(status.total_saved_bytes)
-                ));
+                ))
+                .on_hover_text(
+                    "Private memory pushed out of dozing apps into Windows' compressed memory / pagefile. \
+                     Watch \"RAM available\" below: that's Windows' own figure for what your other apps can use.",
+                );
             });
+            if status.system_total > 0 {
+                let (note, color) = if status.memory_low {
+                    ("low: dozing apps' memory is being released", AMBER)
+                } else {
+                    ("plenty free: dozing apps keep their memory so they wake instantly", Color32::GRAY)
+                };
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "RAM available: {} of {}",
+                        fmt_bytes(status.system_available),
+                        fmt_bytes(status.system_total)
+                    ));
+                    ui.label(RichText::new(format!("({note})")).color(color).small());
+                });
+            }
             ui.add_space(6.0);
         });
 
@@ -360,8 +384,10 @@ fn rule_card(
                 });
             ui.label("after");
             ui.add(egui::DragValue::new(&mut rule.minutes).range(0..=240).suffix(" min"));
-            ui.checkbox(&mut rule.trim, "Free its memory")
-                .on_hover_text("After dozing, push the app's memory out of RAM (into Windows' compressed memory / pagefile). Switching back may take a moment longer.");
+            ui.checkbox(&mut rule.trim, "Free its memory when RAM is low").on_hover_text(
+                "While it dozes and RAM is running low, push its memory out of RAM (into Windows' compressed memory / pagefile) so your other apps can use it. \
+                 With plenty of RAM free its memory stays put, so it wakes instantly.",
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Remove").clicked() {
                     *remove = Some(rule.exe.clone());
@@ -402,9 +428,13 @@ fn state_text(st: Option<&RuleStatus>) -> (String, Color32) {
         Some(RuleState::Paused) => ("Paused".into(), AMBER),
         Some(RuleState::Waiting(why)) => (format!("Active: {why}"), gray),
         Some(RuleState::Counting(left)) => (format!("Dozing in {}", fmt_duration(*left)), AMBER),
-        Some(RuleState::Frozen { for_secs, saved_bytes }) => {
-            let freed = if *saved_bytes > 0 { format!(", {} freed", fmt_bytes(*saved_bytes)) } else { String::new() };
-            (format!("Dozing {}{}", fmt_duration(Duration::from_secs(*for_secs)), freed), FROZEN_BLUE)
+        Some(RuleState::Frozen { for_secs, saved_bytes, trimmed }) => {
+            let memory = if *trimmed {
+                format!(", {} released", fmt_bytes(*saved_bytes))
+            } else {
+                ", memory kept".to_string()
+            };
+            (format!("Dozing {}{}", fmt_duration(Duration::from_secs(*for_secs)), memory), FROZEN_BLUE)
         }
         Some(RuleState::Error(e)) => (e.clone(), RED),
     }
