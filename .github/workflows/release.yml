@@ -1,0 +1,31 @@
+name: release
+
+# Push a tag like v0.1.0 to build WinDoze.exe on Windows and publish it as a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: Copy-Item target/release/windoze.exe WinDoze.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: WinDoze.exe
+          body: |
+            Download **WinDoze.exe** below and double-click it. No install, no admin rights needed. It lives in the system tray.
+
+            **What it does:** pick the background apps you want (Figma, Slack, Discord...), choose when they doze (when minimized, when not in focus, or when idle) and after how many minutes. Switch back to an app and it wakes up right where you left it.
+
+            **Panic key:** Ctrl+Alt+Shift+T wakes everything and pauses WinDoze.
+
+            Windows SmartScreen may warn you because the exe isn't signed yet. Click **More info** then **Run anyway**.
+
+            Requires Windows 10 or 11 (64-bit).

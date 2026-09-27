@@ -34,7 +34,7 @@ Switching back to a dozing app (taskbar, Alt-Tab, clicking its window) wakes it.
 
 ## Run it
 
-Download `WinDoze.exe` and double-click it. No install and no admin rights are needed. It lives in the system tray, and closing the window keeps it running.
+Download `WinDoze.exe` from the [latest release](https://github.com/AkashKhamkar/WinDoze/releases/latest) and double-click it. No install and no admin rights are needed. It lives in the system tray, and closing the window keeps it running.
 
 > Windows SmartScreen / Defender may warn about an unsigned app that suspends other processes. That's expected for an unsigned build.
 
@@ -54,7 +54,7 @@ brew install mingw-w64         # or your distro's mingw-w64 package
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-CI (`.github/workflows/build.yml`) builds the exe on `windows-latest` and uploads it as an artifact.
+CI (`.github/workflows/build.yml`) builds the exe on `windows-latest` and uploads it as an artifact. Pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`) builds the exe and publishes it as a GitHub Release.
 
 ## First-run test checklist
 
