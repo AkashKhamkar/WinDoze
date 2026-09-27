@@ -1,0 +1,2 @@
+// Icon resource 1: the exe's icon in Explorer/taskbar, also loaded by the tray icon.
+1 ICON "windoze.ico"
