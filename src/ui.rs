@@ -159,17 +159,6 @@ impl eframe::App for WinDozeApp {
                     if ui.button("Wake all").clicked() {
                         commands.push(Command::ThawAll);
                     }
-                    let can_release = status.frozen_count > 0;
-                    if ui
-                        .add_enabled(can_release, egui::Button::new("Free memory now"))
-                        .on_hover_text(
-                            "Push the memory of every dozing app out of RAM right now, even if RAM isn't low. \
-                             Watch \"RAM available\" (or Task Manager) over the next few seconds to see the real effect.",
-                        )
-                        .clicked()
-                    {
-                        commands.push(Command::ReleaseNow);
-                    }
                     let label = if cfg.paused { "Resume auto-doze" } else { "Pause auto-doze" };
                     if ui.button(label).clicked() {
                         cfg.paused = !cfg.paused;
@@ -197,7 +186,7 @@ impl eframe::App for WinDozeApp {
                 let (note, color) = if status.memory_low {
                     ("low: dozing apps' memory is being released", AMBER)
                 } else {
-                    ("plenty free: dozing apps keep their memory so they wake instantly", Color32::GRAY)
+                    ("plenty free: dozing apps release memory after 5 minutes asleep", Color32::GRAY)
                 };
                 ui.horizontal(|ui| {
                     ui.label(format!(
@@ -395,9 +384,9 @@ fn rule_card(
                 });
             ui.label("after");
             ui.add(egui::DragValue::new(&mut rule.minutes).range(0..=240).suffix(" min"));
-            ui.checkbox(&mut rule.trim, "Free its memory when RAM is low").on_hover_text(
-                "While it dozes and RAM is running low, push its memory out of RAM (into Windows' compressed memory / pagefile) so your other apps can use it. \
-                 With plenty of RAM free its memory stays put, so it wakes instantly.",
+            ui.checkbox(&mut rule.trim, "Free its memory").on_hover_text(
+                "While it dozes, push its memory out of RAM (into Windows' compressed memory / pagefile) so your other apps can use it. \
+                 Happens right away when RAM is low, otherwise after it has been dozing for 5 minutes, so quick switches stay instant.",
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Remove").clicked() {

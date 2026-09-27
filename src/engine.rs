@@ -65,6 +65,10 @@ const APPS_SCAN_EVERY: Duration = Duration::from_secs(3);
 /// 8 GB PC: low below 1.6 GB available. 16 GB+: low below 2.5 GB.
 const LOW_MEMORY_AVAILABLE: f64 = 0.20;
 const LOW_MEMORY_CAP: u64 = 2560 * 1024 * 1024;
+/// With plenty of RAM free, an app's memory is still released once it has
+/// been dozing this long: you probably won't need it in the next second, and
+/// it leaves headroom before RAM runs short. Quick switches never hit this.
+const RELEASE_AFTER_DOZING: Duration = Duration::from_secs(5 * 60);
 /// How long after a release to re-check Windows' available RAM for the log.
 const FOLLOW_UP_AFTER: Duration = Duration::from_secs(10);
 /// Keep the app you just copied from awake this long, so pasting from it works.
@@ -666,15 +670,6 @@ impl Engine {
 
         for cmd in commands {
             match cmd {
-                Command::ReleaseNow => {
-                    for f in freezer::frozen_info().into_iter().filter(|f| !f.trimmed) {
-                        let avail_before = available_ram();
-                        if freezer::trim_dozing(&f.exe).is_some() {
-                            self.follow_ups.push((f.exe, avail_before, now));
-                        }
-                    }
-                    shared::repaint_ui();
-                }
                 Command::ThawAll => {
                     freezer::thaw_all("wake all");
                     self.reset_all();
@@ -754,19 +749,22 @@ impl Engine {
         }
         self.rt.retain(|exe, _| rule_exes.contains(exe));
 
-        // RAM got tight after some apps dozed: push out the memory of the one
-        // that's been asleep longest (one per tick to spread the disk work).
-        if memory_low() {
-            let oldest_untrimmed = freezer::frozen_info()
-                .into_iter()
-                .filter(|f| !f.trimmed && cfg.rule(&f.exe).is_some_and(|r| r.trim))
-                .min_by_key(|f| f.since);
-            if let Some(f) = oldest_untrimmed {
-                logln!("RAM is low; freeing memory of {}, which is already dozing", f.exe);
-                let avail_before = available_ram();
-                if freezer::trim_dozing(&f.exe).is_some() {
-                    self.follow_ups.push((f.exe, avail_before, now));
-                }
+        // Release the memory of apps that are already dozing, automatically:
+        // right away if RAM is low (e.g. it got tight after they dozed), or once
+        // they've been asleep for RELEASE_AFTER_DOZING. Oldest first, one per
+        // tick to spread the work.
+        let low = memory_low();
+        let oldest_untrimmed = freezer::frozen_info()
+            .into_iter()
+            .filter(|f| !f.trimmed && cfg.rule(&f.exe).is_some_and(|r| r.trim))
+            .filter(|f| low || f.since.elapsed() >= RELEASE_AFTER_DOZING)
+            .min_by_key(|f| f.since);
+        if let Some(f) = oldest_untrimmed {
+            let why = if low { "RAM is low" } else { "it has been dozing for 5 minutes" };
+            logln!("freeing memory of {} ({why})", f.exe);
+            let avail_before = available_ram();
+            if freezer::trim_dozing(&f.exe).is_some() {
+                self.follow_ups.push((f.exe, avail_before, now));
             }
         }
 

@@ -16,9 +16,9 @@ Each app can also wait a few minutes before dozing. The default, `0 min`, means 
 
 Switching back to a dozing app wakes it: click its taskbar button or thumbnail, Alt-Tab to it, or click its window. Under the hood, dozing means all of the app's processes are suspended. It stops using CPU and stops touching its memory, so Windows can hand that memory to the app you're using instead of thrashing the disk.
 
-When RAM runs low (under 20% available, at most 2.5 GB), WinDoze also pushes dozing apps' memory out of RAM ("Free its memory when RAM is low"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail. With plenty of RAM free, the memory stays put, because pushing it out would gain nothing and would only make switching back slower.
+WinDoze also pushes dozing apps' memory out of RAM automatically ("Free its memory"): right away when RAM runs low (under 20% available, at most 2.5 GB), otherwise once an app has been dozing for 5 minutes. Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail. Quick switches (away and back within 5 minutes, with RAM to spare) keep the memory in place, so they stay instant.
 
-The header shows **RAM available**: Windows' own figure for what your apps can use. It's the honest way to see WinDoze working. **Free memory now** pushes out every dozing app's memory on demand, and the log re-checks RAM available 10 seconds after each release.
+The header shows **RAM available**: Windows' own figure for what your apps can use. It's the honest way to see WinDoze working. The log re-checks RAM available 10 seconds after each release.
 
 ### What to expect (honestly)
 
