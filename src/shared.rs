@@ -49,6 +49,8 @@ pub enum Command {
     FreezeNow(String),
     Thaw(String),
     ThawAll,
+    /// Force quit every process of the app.
+    Kill(String),
 }
 
 #[derive(Default)]

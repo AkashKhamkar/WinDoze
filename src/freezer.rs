@@ -175,6 +175,27 @@ pub fn thaw(exe: &str, reason: &str) -> bool {
     true
 }
 
+/// Forget dozing processes that no longer exist (the app was closed or force
+/// quit). Without this a closed app would show as "Dozing" forever.
+pub fn prune_exited() {
+    let mut frozen = lock();
+    let before = frozen.len();
+    let mut changed = false;
+    frozen.retain_mut(|g| {
+        let n = g.procs.len();
+        g.procs.retain(|p| win::is_running(&p.handle));
+        changed |= g.procs.len() != n;
+        if g.procs.is_empty() {
+            logln!("{} exited while dozing", g.exe);
+        }
+        !g.procs.is_empty()
+    });
+    if changed || frozen.len() != before {
+        update_flag(&frozen);
+        write_journal(&journal_entries_of(&frozen));
+    }
+}
+
 pub fn thaw_all(reason: &str) {
     let mut frozen = lock();
     for g in frozen.drain(..) {

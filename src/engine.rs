@@ -629,6 +629,7 @@ impl Engine {
             (s.config.clone(), std::mem::take(&mut s.commands))
         };
 
+        freezer::prune_exited();
         let procs = win::snapshot_processes();
         let windows = win::app_windows();
         let tree = ProcTree::new(&procs);
@@ -647,6 +648,25 @@ impl Engine {
                     freezer::thaw(&exe, "woken from WinDoze");
                     self.reset_rule(&exe);
                 }
+                Command::Kill(exe) => {
+                    let mut pids: HashSet<u32> = group_of(&exe).into_iter().collect();
+                    if let Some(f) = freezer::frozen_info().into_iter().find(|f| f.exe == exe) {
+                        pids.extend(f.pids);
+                    }
+                    let failed = pids.iter().filter(|&&p| !win::terminate(p)).count();
+                    // Resume anything that survived, so nothing is left stuck asleep.
+                    freezer::thaw(&exe, "force quit");
+                    self.reset_rule(&exe);
+                    logln!("force quit {exe}: {} of {} processes ended", pids.len() - failed, pids.len());
+                    if failed > 0 {
+                        let rt = self.rt.entry(exe.clone()).or_default();
+                        rt.last_error = Some(format!(
+                            "Couldn't force quit {failed} process(es). Is it running as administrator?"
+                        ));
+                        rt.retry_after = Some(now + Duration::from_secs(10));
+                    }
+                    shared::repaint_ui();
+                }
                 Command::FreezeNow(exe) => {
                     let trim = cfg.rule(&exe).map(|r| r.trim).unwrap_or(true);
                     let rt = self.rt.entry(exe.clone()).or_default();
@@ -654,7 +674,7 @@ impl Engine {
                         Ok(_) => rt.last_error = None,
                         Err(e) => {
                             logln!("manual doze of {exe} failed: {e}");
-                            rt.last_error = Some(e);
+                            rt.last_error = Some(format!("Can't doze: {e}"));
                             rt.retry_after = Some(now + RETRY_AFTER_ERROR);
                         }
                     }
@@ -799,6 +819,7 @@ impl Engine {
             }
             Err(e) => {
                 logln!("could not doze {}: {e}", rule.exe);
+                let e = format!("Can't doze: {e}");
                 rt.last_error = Some(e.clone());
                 rt.retry_after = Some(now + RETRY_AFTER_ERROR);
                 rt.cond_since = None;

@@ -53,7 +53,7 @@ pub fn run(start_hidden: bool) -> eframe::Result {
         Box::new(|cc| {
             let _ = shared::UI_CTX.set(cc.egui_ctx.clone());
             let excluded_text = shared::shared().config.excluded_children.join(", ");
-            Ok(Box::new(WinDozeApp { tray: build_tray(), excluded_text }))
+            Ok(Box::new(WinDozeApp { tray: build_tray(), excluded_text, pending_kill: None }))
         }),
     )
 }
@@ -114,6 +114,8 @@ fn build_tray() -> Option<TrayIcon> {
 struct WinDozeApp {
     tray: Option<TrayIcon>,
     excluded_text: String,
+    /// App waiting for "are you sure?" before force quitting: (exe, display name).
+    pending_kill: Option<(String, String)>,
 }
 
 impl eframe::App for WinDozeApp {
@@ -199,14 +201,54 @@ impl eframe::App for WinDozeApp {
                 ui.heading("Apps you doze");
                 ui.label(RichText::new("Only the apps you add here are ever put to sleep. Switching back to a dozing app wakes it.").weak());
                 ui.add_space(4.0);
+                // Only apps that are open right now get a card. Closed apps keep
+                // their settings and come back automatically when reopened.
+                let is_running = |exe: &str| {
+                    !matches!(status.rules.get(exe).map(|s| &s.state), Some(RuleState::NotRunning))
+                };
+                let running_count = cfg.rules.iter().filter(|r| is_running(&r.exe)).count();
                 if cfg.rules.is_empty() {
                     ui.label(RichText::new("No apps yet. Add one from \"Running apps\" below.").italics());
+                } else if running_count == 0 {
+                    ui.label(RichText::new("None of your apps are open right now.").italics());
                 }
                 let mut remove: Option<String> = None;
-                for rule in &mut cfg.rules {
+                for rule in cfg.rules.iter_mut().filter(|r| is_running(&r.exe)) {
                     let st = status.rules.get(&rule.exe);
-                    rule_card(ui, rule, st, &mut commands, &mut remove);
+                    rule_card(ui, rule, st, &mut commands, &mut remove, &mut self.pending_kill);
                     ui.add_space(6.0);
+                }
+                let closed: Vec<(String, String, Mode, u32)> = cfg
+                    .rules
+                    .iter()
+                    .filter(|r| !is_running(&r.exe))
+                    .map(|r| (r.exe.clone(), r.display_name.clone(), r.mode, r.minutes))
+                    .collect();
+                if !closed.is_empty() {
+                    egui::CollapsingHeader::new(format!("Not running ({})", closed.len()))
+                        .id_salt("not-running")
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("These apps are closed. Their settings are kept and apply again when you open them.")
+                                    .small()
+                                    .weak(),
+                            );
+                            for (exe, name, mode, minutes) in &closed {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(name).strong());
+                                    ui.label(
+                                        RichText::new(format!("{} after {minutes} min", mode.label().to_lowercase()))
+                                            .weak()
+                                            .small(),
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.small_button("Remove").clicked() {
+                                            remove = Some(exe.clone());
+                                        }
+                                    });
+                                });
+                            }
+                        });
                 }
                 if let Some(exe) = remove {
                     commands.push(Command::Thaw(exe.clone()));
@@ -227,6 +269,30 @@ impl eframe::App for WinDozeApp {
                 });
             });
         });
+
+        if let Some((exe, name)) = self.pending_kill.clone() {
+            let modal = egui::Modal::new(egui::Id::new("confirm-force-quit")).show(ui.ctx(), |ui| {
+                ui.set_width(360.0);
+                ui.heading(format!("Force quit {name}?"));
+                ui.add_space(4.0);
+                ui.label("This closes all of its windows and processes right away. Anything you haven't saved will be lost.");
+                ui.add_space(10.0);
+                let mut done = false;
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Force quit").color(RED).strong()).clicked() {
+                        commands.push(Command::Kill(exe.clone()));
+                        done = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        done = true;
+                    }
+                });
+                done
+            });
+            if modal.inner || modal.should_close() {
+                self.pending_kill = None;
+            }
+        }
 
         // Apply changes.
         for rule in &cfg.rules {
@@ -252,7 +318,14 @@ impl eframe::App for WinDozeApp {
     }
 }
 
-fn rule_card(ui: &mut egui::Ui, rule: &mut Rule, st: Option<&RuleStatus>, commands: &mut Vec<Command>, remove: &mut Option<String>) {
+fn rule_card(
+    ui: &mut egui::Ui,
+    rule: &mut Rule,
+    st: Option<&RuleStatus>,
+    commands: &mut Vec<Command>,
+    remove: &mut Option<String>,
+    pending_kill: &mut Option<(String, String)>,
+) {
     egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
         ui.set_width(ui.available_width());
         let frozen = matches!(st.map(|s| &s.state), Some(RuleState::Frozen { .. }));
@@ -262,6 +335,13 @@ fn rule_card(ui: &mut egui::Ui, rule: &mut Rule, st: Option<&RuleStatus>, comman
             ui.checkbox(&mut rule.enabled, "");
             ui.label(RichText::new(&rule.display_name).strong().size(16.0));
             ui.label(RichText::new(&rule.exe).weak().small());
+            if ui
+                .small_button(RichText::new("Force quit").color(RED))
+                .on_hover_text("Close the app right away, e.g. if it's stuck. Unsaved work is lost.")
+                .clicked()
+            {
+                *pending_kill = Some((rule.exe.clone(), rule.display_name.clone()));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (text, color) = state_text(st);
                 ui.label(RichText::new(text).color(color).strong());
@@ -326,7 +406,7 @@ fn state_text(st: Option<&RuleStatus>) -> (String, Color32) {
             let freed = if *saved_bytes > 0 { format!(", {} freed", fmt_bytes(*saved_bytes)) } else { String::new() };
             (format!("Dozing {}{}", fmt_duration(Duration::from_secs(*for_secs)), freed), FROZEN_BLUE)
         }
-        Some(RuleState::Error(e)) => (format!("Can't doze: {e}"), RED),
+        Some(RuleState::Error(e)) => (e.clone(), RED),
     }
 }
 

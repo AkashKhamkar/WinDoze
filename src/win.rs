@@ -14,8 +14,8 @@ use windows::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInf
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow,
@@ -91,6 +91,20 @@ pub fn working_set_bytes(h: &OwnedHandle) -> Option<u64> {
     let cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
     unsafe { GetProcessMemoryInfo(h.0, &mut pmc, cb).ok()? };
     Some(pmc.WorkingSetSize as u64)
+}
+
+pub fn is_running(h: &OwnedHandle) -> bool {
+    const STILL_ACTIVE: u32 = 259;
+    let mut code = 0u32;
+    unsafe { GetExitCodeProcess(h.0, &mut code).is_ok() && code == STILL_ACTIVE }
+}
+
+/// End a process immediately (like "End task"). Returns false if Windows refused.
+pub fn terminate(pid: u32) -> bool {
+    match open_process(pid, PROCESS_TERMINATE) {
+        Ok(h) => unsafe { TerminateProcess(h.0, 1).is_ok() },
+        Err(_) => false,
+    }
 }
 
 pub fn empty_working_set(h: &OwnedHandle) -> bool {

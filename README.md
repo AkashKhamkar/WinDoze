@@ -14,6 +14,8 @@ You pick the apps (e.g. Figma, Claude, Slack). For each one you choose **when** 
 
 Switching back to a dozing app wakes it: click its taskbar button or thumbnail, Alt-Tab to it, or click its window. Under the hood, dozing means all of the app's processes are suspended. Optionally, WinDoze also pushes a dozing app's memory out of RAM ("Free its memory"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail.
 
+Only apps that are open show up on the home screen. When you close an app, WinDoze keeps its settings and tucks it into a **Not running** list, and it comes back with the same settings the next time you open it. Each app also has a **Force quit** button (with an "are you sure?") for when something gets stuck.
+
 ## Safety rails
 
 - **Opt-in only.** Nothing dozes unless you add it. Windows and security processes (explorer, dwm, csrss, Defender, WSL/`vmmem`, …) can't be dozed even if you try.
