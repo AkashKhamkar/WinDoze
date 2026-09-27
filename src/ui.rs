@@ -448,7 +448,10 @@ fn settings(ui: &mut egui::Ui, cfg: &mut Config, excluded_text: &mut String) {
         ui.add(egui::Slider::new(&mut cfg.idle_cpu_percent, 0.1..=10.0).suffix("% of total CPU"));
     });
     ui.checkbox(&mut cfg.skip_if_playing_audio, "Never doze an app that is playing audio (music, calls, videos)");
-    ui.checkbox(&mut cfg.skip_if_clipboard_owner, "Never doze the app you last copied from (pasting from a dozing app can hang)");
+    ui.checkbox(
+        &mut cfg.skip_if_clipboard_owner,
+        "Keep the app you just copied from awake for a minute, so pasting from it works",
+    );
     ui.checkbox(&mut cfg.start_with_windows, "Start WinDoze with Windows (in the tray)");
     ui.add_space(6.0);
     ui.label("Never doze these child processes, or anything they start. This keeps builds and dev servers in an editor's terminal alive, but one that prints a lot of output may still pause until the editor is woken, because the editor is what reads that output:");

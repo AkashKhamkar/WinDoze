@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, LPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
-use windows::Win32::System::DataExchange::GetClipboardOwner;
+use windows::Win32::System::DataExchange::{GetClipboardOwner, GetClipboardSequenceNumber};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -353,6 +353,11 @@ pub fn root_window_at(pt: POINT) -> HWND {
 /// Restore and bring a window to the front, the way Alt-Tab does.
 pub fn restore_window(hwnd: isize) {
     unsafe { SwitchToThisWindow(HWND(hwnd as *mut _), true) };
+}
+
+/// Changes every time anything is copied.
+pub fn clipboard_sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
 }
 
 pub fn clipboard_owner_pid() -> Option<u32> {

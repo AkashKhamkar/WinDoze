@@ -58,6 +58,8 @@ const GRACE: Duration = Duration::from_secs(5);
 const AUDIO_HOLD: Duration = Duration::from_secs(30);
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
 const APPS_SCAN_EVERY: Duration = Duration::from_secs(3);
+/// Keep the app you just copied from awake this long, so pasting from it works.
+const CLIPBOARD_HOLD: Duration = Duration::from_secs(60);
 
 static ENGINE_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Set between WM_QUERYENDSESSION and a cancelled WM_ENDSESSION: never freeze
@@ -324,6 +326,9 @@ struct Engine {
     fallback_fg: Option<isize>,
     /// Last foreground window that was an app (not the taskbar / Alt-Tab).
     last_app_fg: isize,
+    /// Last clipboard sequence number seen, and when it last changed (= a copy).
+    clip_seq: u32,
+    clip_copied_at: Option<Instant>,
     /// Apps just woken by a click/pick whose windows we should make sure come back.
     restore_pending: Vec<(String, HashSet<u32>, isize)>,
 }
@@ -349,6 +354,8 @@ impl Engine {
             switcher: None,
             fallback_fg: None,
             last_app_fg: 0,
+            clip_seq: win::clipboard_sequence(),
+            clip_copied_at: None,
             restore_pending: Vec::new(),
         }
     }
@@ -695,7 +702,15 @@ impl Engine {
             && !cfg.paused
             && cfg.rules.iter().any(|r| r.enabled && !frozen.contains_key(&r.exe) && !groups[&r.exe].is_empty());
         let audio = if need_audio { crate::audio::pids_playing_audio() } else { HashSet::new() };
-        let clip = if cfg.skip_if_clipboard_owner { win::clipboard_owner_pid() } else { None };
+        // Only the app you copied from *recently* is kept awake: pastes almost
+        // always happen within a minute, and after that it may doze like anything else.
+        let seq = win::clipboard_sequence();
+        if seq != self.clip_seq {
+            self.clip_seq = seq;
+            self.clip_copied_at = Some(now);
+        }
+        let recent_copy = self.clip_copied_at.is_some_and(|t| now - t < CLIPBOARD_HOLD);
+        let clip = if cfg.skip_if_clipboard_owner && recent_copy { win::clipboard_owner_pid() } else { None };
 
         let mut statuses = HashMap::new();
         for rule in &cfg.rules {
@@ -867,7 +882,7 @@ fn condition(
         return Err("Playing audio".into());
     }
     if cfg.skip_if_clipboard_owner && owns(clip) {
-        return Err("Owns the clipboard".into());
+        return Err("You just copied from it".into());
     }
     Ok(())
 }

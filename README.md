@@ -6,11 +6,13 @@ You pick the apps (e.g. Figma, Claude, Slack). For each one you choose **when** 
 
 | Mode | Dozes when… |
 |---|---|
-| **When minimized** | every window of the app has been minimized for N minutes |
-| **When not in focus** | you've been using other apps for N minutes (even if its window is visible) |
-| **When idle** | it's not in focus **and** using almost no CPU (default < 1% of total) **and** not playing audio, for N minutes |
+| **When I switch away** (default) | you switch to another app (Alt-Tab, the taskbar, or clicking another window), even if its window is still visible |
+| **When minimized** | every window of the app is minimized |
+| **When idle in the background** | you've switched away **and** it's using almost no CPU (default < 1% of total) **and** not playing audio |
 
-`0 min` means "after 5 seconds", so a quick Alt-Tab never dozes anything.
+For example, with Figma and Slack both added: work in Figma, Alt-Tab to Slack, and Figma dozes. Alt-Tab (or click) back to Figma and it wakes up where you left it, while Slack dozes.
+
+Each app can also wait a few minutes before dozing. The default, `0 min`, means "after 5 seconds", so a quick Alt-Tab back and forth never dozes anything.
 
 Switching back to a dozing app wakes it: click its taskbar button or thumbnail, Alt-Tab to it, or click its window. Under the hood, dozing means all of the app's processes are suspended. Optionally, WinDoze also pushes a dozing app's memory out of RAM ("Free its memory"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail.
 
@@ -22,7 +24,7 @@ Only apps that are open show up on the home screen. When you close an app, WinDo
 - **Child processes are separated.** Terminals, shells and anything they start (for example `npm run dev` in Cursor's terminal) never doze with their parent app. The list is editable in Settings. A browser opened by clicking a link inside an app is also left alone. Caveat: see Known limits.
 - **Dozing is skipped while an app:**
   - is playing audio
-  - owns the clipboard (pasting from a dozing app can hang)
+  - is the app you copied from in the last minute (so pasting from it works)
   - has no open window (tray-only apps can't be woken by switching to them)
 - **All-or-nothing.** If any process of an app can't be suspended, none are.
 - **Many ways to wake:**
@@ -62,13 +64,14 @@ CI (`.github/workflows/build.yml`) builds the exe on `windows-latest` and upload
 
 Use a real Windows PC. A VM is fine for checking basics, but its memory behaviour won't match an 8 GB laptop, and some VMs lack OpenGL (you'll get an error box).
 
-1. Open Figma (or any Electron app). In WinDoze, click **Add** next to it and choose **When minimized**, **0 min**.
-2. Minimize Figma. Within ~5 s its status turns **Dozing** and shows the memory freed. In Task Manager → Details, its processes show **Suspended**.
-3. Click Figma on the taskbar. It should wake and restore right away.
+1. Open Figma and Slack (or any two apps). In WinDoze, click **Add** next to both. New apps default to **When I switch away**, **0 min**.
+2. Click into Figma, then Alt-Tab to Slack. Within ~5 s Figma's status turns **Dozing** and shows the memory freed. In Task Manager → Details, its processes show **Suspended**.
+3. Click Figma on the taskbar. It should wake and come to the front right away, and Slack starts its 5 s countdown.
 4. Let it doze again, then check the other ways back in:
    - hover over its taskbar button and click the thumbnail
    - Alt-Tab to it
-   - set it to **When not in focus**, leave its window visible, let it doze, then click on the window
+   - put Figma and Slack side by side, let Figma doze, then click on Figma's window
+   - switch Figma to **When minimized**, minimize it, let it doze, then click it on the taskbar
    - tray → **Wake all**, then **Ctrl+Alt+Shift+T**
 
    If any of these doesn't wake it, open the log (Settings → Open log folder) and send the lines starting with `taskbar click on` or `switcher`. They show what WinDoze saw.

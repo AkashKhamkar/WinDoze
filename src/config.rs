@@ -16,21 +16,26 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Minimized, Mode::Unfocused, Mode::Idle];
+    /// In the order shown in the dropdown; the first is the default.
+    pub const ALL: [Mode; 3] = [Mode::Unfocused, Mode::Minimized, Mode::Idle];
 
     pub fn label(self) -> &'static str {
         match self {
+            Mode::Unfocused => "When I switch away",
             Mode::Minimized => "When minimized",
-            Mode::Unfocused => "When not in focus",
-            Mode::Idle => "When idle",
+            Mode::Idle => "When idle in the background",
         }
     }
 
     pub fn help(self) -> &'static str {
         match self {
-            Mode::Minimized => "Doze once every window of the app has been minimized for the chosen time.",
-            Mode::Unfocused => "Doze once you've been using other apps for the chosen time (even if its window is still visible).",
-            Mode::Idle => "Doze once it's not in focus AND doing nothing in the background (CPU below the idle threshold, no audio) for the chosen time.",
+            Mode::Unfocused => {
+                "Dozes once you switch to another app (Alt-Tab, taskbar, clicking another window), even if its window is still visible."
+            }
+            Mode::Minimized => "Dozes only once every window of the app is minimized.",
+            Mode::Idle => {
+                "Dozes once you've switched away AND it's doing nothing in the background (CPU below the idle threshold, no audio)."
+            }
         }
     }
 }
@@ -54,8 +59,8 @@ impl Rule {
             exe: exe.to_lowercase(),
             display_name: display_name.to_string(),
             enabled: true,
-            mode: Mode::Minimized,
-            minutes: 2,
+            mode: Mode::ALL[0],
+            minutes: 0,
             trim: true,
         }
     }
