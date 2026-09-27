@@ -58,11 +58,15 @@ const GRACE: Duration = Duration::from_secs(5);
 const AUDIO_HOLD: Duration = Duration::from_secs(30);
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
 const APPS_SCAN_EVERY: Duration = Duration::from_secs(3);
-/// RAM counts as "low" when Windows has less than this share of it available.
-/// Only then do we push dozing apps' memory out: with plenty free, trimming
-/// gains nothing and just makes switching back slower (the app has to page
-/// its memory back in).
-const LOW_MEMORY_AVAILABLE: f64 = 0.30;
+/// RAM counts as "low" when Windows has less than this share of it available,
+/// capped at LOW_MEMORY_CAP. Only then do we push dozing apps' memory out:
+/// with plenty free, trimming gains nothing and just makes switching back
+/// slower (the app has to page its memory back in).
+/// 8 GB PC: low below 1.6 GB available. 16 GB+: low below 2.5 GB.
+const LOW_MEMORY_AVAILABLE: f64 = 0.20;
+const LOW_MEMORY_CAP: u64 = 2560 * 1024 * 1024;
+/// How long after a release to re-check Windows' available RAM for the log.
+const FOLLOW_UP_AFTER: Duration = Duration::from_secs(10);
 /// Keep the app you just copied from awake this long, so pasting from it works.
 const CLIPBOARD_HOLD: Duration = Duration::from_secs(60);
 
@@ -331,6 +335,8 @@ struct Engine {
     fallback_fg: Option<isize>,
     /// Last foreground window that was an app (not the taskbar / Alt-Tab).
     last_app_fg: isize,
+    /// Releases to re-measure: (app, Windows' available RAM just before, when).
+    follow_ups: Vec<(String, u64, Instant)>,
     /// Last clipboard sequence number seen, and when it last changed (= a copy).
     clip_seq: u32,
     clip_copied_at: Option<Instant>,
@@ -359,6 +365,7 @@ impl Engine {
             switcher: None,
             fallback_fg: None,
             last_app_fg: 0,
+            follow_ups: Vec::new(),
             clip_seq: win::clipboard_sequence(),
             clip_copied_at: None,
             restore_pending: Vec::new(),
@@ -451,12 +458,10 @@ impl Engine {
             }
             Some((_, false)) => {} // an app that isn't dozing; Windows handles it
             None => {
-                // Only an app's taskbar button ("Figma - 1 running window"), or a
-                // click we couldn't read at all, gets the safety net; not Start,
-                // the clock, empty taskbar space, etc.
-                let app_button =
-                    names.is_empty() || names.iter().any(|n| n.to_lowercase().contains("running window"));
-                if app_button {
+                // Only when we couldn't read the taskbar at all do we fall back to
+                // "wake everything if nothing opens". A button we *can* read that
+                // matches no dozing app (File Explorer, Task Manager...) isn't ours.
+                if names.is_empty() {
                     logln!("taskbar click on {names:?}: no app matched, waiting to see if anything opens");
                     self.fallback_fg = Some(win::foreground_window().0 as isize);
                     if let Some(h) = engine_hwnd() {
@@ -516,7 +521,16 @@ impl Engine {
             }
             return;
         }
-        let names = self.uia().map(|u| u.focused_names()).unwrap_or_default();
+        // Windows 11 keeps focus on the "Task Switching" pane, so ask for the
+        // *selected* item first and only fall back to the focused one.
+        let fg = win::foreground_window();
+        let names = self
+            .uia()
+            .map(|u| {
+                let selected = u.selected_item_names(fg);
+                if selected.is_empty() { u.focused_names() } else { selected }
+            })
+            .unwrap_or_default();
         if names.is_empty() {
             return;
         }
@@ -652,6 +666,15 @@ impl Engine {
 
         for cmd in commands {
             match cmd {
+                Command::ReleaseNow => {
+                    for f in freezer::frozen_info().into_iter().filter(|f| !f.trimmed) {
+                        let avail_before = available_ram();
+                        if freezer::trim_dozing(&f.exe).is_some() {
+                            self.follow_ups.push((f.exe, avail_before, now));
+                        }
+                    }
+                    shared::repaint_ui();
+                }
                 Command::ThawAll => {
                     freezer::thaw_all("wake all");
                     self.reset_all();
@@ -682,8 +705,14 @@ impl Engine {
                 Command::FreezeNow(exe) => {
                     let trim = cfg.rule(&exe).map(|r| r.trim).unwrap_or(true) && memory_low();
                     let rt = self.rt.entry(exe.clone()).or_default();
+                    let avail_before = available_ram();
                     match freezer::freeze_group(&exe, &group_of(&exe), trim) {
-                        Ok(_) => rt.last_error = None,
+                        Ok(_) => {
+                            rt.last_error = None;
+                            if trim {
+                                self.follow_ups.push((exe.clone(), avail_before, now));
+                            }
+                        }
                         Err(e) => {
                             logln!("manual doze of {exe} failed: {e}");
                             rt.last_error = Some(format!("Can't doze: {e}"));
@@ -734,13 +763,33 @@ impl Engine {
                 .min_by_key(|f| f.since);
             if let Some(f) = oldest_untrimmed {
                 logln!("RAM is low; freeing memory of {}, which is already dozing", f.exe);
-                freezer::trim_dozing(&f.exe);
+                let avail_before = available_ram();
+                if freezer::trim_dozing(&f.exe).is_some() {
+                    self.follow_ups.push((f.exe, avail_before, now));
+                }
             }
         }
 
         if self.last_apps_scan.is_none_or(|t| now - t >= APPS_SCAN_EVERY) {
             self.last_apps_scan = Some(now);
             self.apps_cache = scan_apps(&tree, &windows, &excluded, &rule_exes);
+        }
+
+        // Windows compresses / writes released memory over a few seconds, so the
+        // honest measure of a release is available RAM a little later.
+        let (due, pending): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.follow_ups).into_iter().partition(|(_, _, t)| now - *t >= FOLLOW_UP_AFTER);
+        self.follow_ups = pending;
+        for (exe, before, _) in due {
+            let after = available_ram();
+            let mb = |b: u64| b as f64 / 1_048_576.0;
+            logln!(
+                "{}s after releasing {exe}: Windows available RAM {:.0} -> {:.0} MB ({:+.0} MB; other apps' activity counts too)",
+                FOLLOW_UP_AFTER.as_secs(),
+                mb(before),
+                mb(after),
+                mb(after) - mb(before)
+            );
         }
 
         let frozen_now = freezer::frozen_info();
@@ -846,6 +895,7 @@ impl Engine {
         }
 
         let trim = rule.trim && memory_low();
+        let avail_before = available_ram();
         match freezer::freeze_group(&rule.exe, group, trim) {
             Ok(saved) => {
                 rt.last_error = None;
@@ -855,6 +905,9 @@ impl Engine {
                     freezer::thaw(&rule.exe, "switched to it while dozing it");
                     rt.cond_since = None;
                     return status(RuleState::Waiting("In use".into()));
+                }
+                if trim {
+                    self.follow_ups.push((rule.exe.clone(), avail_before, now));
                 }
                 shared::repaint_ui();
                 status(RuleState::Frozen { for_secs: 0, saved_bytes: saved, trimmed: trim })
@@ -927,10 +980,17 @@ fn measure(group: &[u32]) -> (u64, u64) {
     (mem, cpu)
 }
 
+fn available_ram() -> u64 {
+    win::system_memory().map(|m| m.1).unwrap_or(0)
+}
+
 /// Is Windows short on RAM right now?
 fn memory_low() -> bool {
     match win::system_memory() {
-        Some((total, avail)) if total > 0 => (avail as f64) < total as f64 * LOW_MEMORY_AVAILABLE,
+        Some((total, avail)) if total > 0 => {
+            let threshold = ((total as f64 * LOW_MEMORY_AVAILABLE) as u64).min(LOW_MEMORY_CAP);
+            avail < threshold
+        }
         _ => true, // can't tell: behave as before and free memory
     }
 }

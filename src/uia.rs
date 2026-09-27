@@ -3,10 +3,12 @@
 //! A dozing app can't react to those clicks itself, so we have to work out
 //! which app they were meant for.
 
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement, IUIAutomationTreeWalker,
+    TreeScope_Descendants, UIA_SelectionItemIsSelectedPropertyId,
 };
 use windows::core::Interface;
 
@@ -43,6 +45,21 @@ impl Uia {
     pub fn focused_names(&self) -> Vec<String> {
         let el = unsafe { self.auto.GetFocusedElement().ok() };
         self.names_up(el, 1)
+    }
+
+    /// Name of the selected item inside a window, e.g. the highlighted app in
+    /// Windows 11's Alt-Tab, where keyboard focus stays on the "Task Switching"
+    /// pane and never moves to the items.
+    pub fn selected_item_names(&self, window: HWND) -> Vec<String> {
+        let found = unsafe {
+            (|| {
+                let root = self.auto.ElementFromHandle(window).ok()?;
+                let selected = VARIANT::from(true);
+                let cond = self.auto.CreatePropertyCondition(UIA_SelectionItemIsSelectedPropertyId, &selected).ok()?;
+                root.FindFirst(TreeScope_Descendants, &cond).ok()
+            })()
+        };
+        self.names_up(found, 0)
     }
 
     fn names_up(&self, mut el: Option<IUIAutomationElement>, parents: usize) -> Vec<String> {

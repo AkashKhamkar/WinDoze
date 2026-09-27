@@ -113,13 +113,21 @@ pub fn freeze_group(exe: &str, pids: &[u32], trim: bool) -> Result<u64, String> 
     let with_trim = required | PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA;
     let mut procs = Vec::with_capacity(pids.len());
     for &pid in pids {
-        let handle = win::open_process(pid, with_trim)
-            .or_else(|_| win::open_process(pid, required))
-            .map_err(|e| {
-                format!("can't open process {pid} ({}). Is the app running as administrator?", e.message())
-            })?;
+        let handle = match win::open_process(pid, with_trim).or_else(|_| win::open_process(pid, required)) {
+            Ok(h) => h,
+            // ERROR_INVALID_PARAMETER: the process exited a moment ago. Apps like
+            // VS Code start and stop helpers all the time; that's no reason to fail.
+            Err(e) if e.code() == windows::Win32::Foundation::E_INVALIDARG => continue,
+            Err(e) => {
+                return Err(format!("can't open process {pid} ({}). Is the app running as administrator?", e.message()));
+            }
+        };
         let create_time = win::process_times(&handle).map(|t| t.0).unwrap_or(0);
         procs.push(FrozenProc { pid, create_time, handle });
+    }
+
+    if procs.is_empty() {
+        return Err("the app just closed".into());
     }
 
     // 2. Journal first, so even a crash mid-suspend is recoverable.

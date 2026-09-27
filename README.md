@@ -16,9 +16,14 @@ Each app can also wait a few minutes before dozing. The default, `0 min`, means 
 
 Switching back to a dozing app wakes it: click its taskbar button or thumbnail, Alt-Tab to it, or click its window. Under the hood, dozing means all of the app's processes are suspended. It stops using CPU and stops touching its memory, so Windows can hand that memory to the app you're using instead of thrashing the disk.
 
-When RAM runs low (under 30% available), WinDoze also pushes dozing apps' memory out of RAM ("Free its memory when RAM is low"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail. With plenty of RAM free, the memory stays put, because pushing it out would gain nothing and would only make switching back slower.
+When RAM runs low (under 20% available, at most 2.5 GB), WinDoze also pushes dozing apps' memory out of RAM ("Free its memory when RAM is low"). Because the app's threads are suspended, it can't pull that memory straight back in, which is where ordinary "RAM cleaners" fail. With plenty of RAM free, the memory stays put, because pushing it out would gain nothing and would only make switching back slower.
 
-The header shows **RAM available**: Windows' own figure for what your apps can use. It's the honest way to see WinDoze working.
+The header shows **RAM available**: Windows' own figure for what your apps can use. It's the honest way to see WinDoze working. **Free memory now** pushes out every dozing app's memory on demand, and the log re-checks RAM available 10 seconds after each release.
+
+### What to expect (honestly)
+
+- **Plenty of free RAM (say 16 GB with 4+ GB available):** your RAM and CPU graphs barely move, and that's normal. Idle background apps already use close to 0% CPU, and when nothing is short of memory, dozing only stops them waking up. WinDoze earns its keep when RAM runs out: that's when background apps start fighting the one you're using, and the disk starts thrashing.
+- **Released memory mostly stays in RAM, compressed.** Windows 10/11 compresses memory pushed out of an app instead of writing it to disk. Releasing 2 GB typically gives back a fraction of that as available RAM (how much depends on how well it compresses), and it shows up over a few seconds.
 
 Only apps that are open show up on the home screen. When you close an app, WinDoze keeps its settings and tucks it into a **Not running** list, and it comes back with the same settings the next time you open it. Each app also has a **Force quit** button (with an "are you sure?") for when something gets stuck.
 

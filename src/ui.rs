@@ -159,6 +159,17 @@ impl eframe::App for WinDozeApp {
                     if ui.button("Wake all").clicked() {
                         commands.push(Command::ThawAll);
                     }
+                    let can_release = status.frozen_count > 0;
+                    if ui
+                        .add_enabled(can_release, egui::Button::new("Free memory now"))
+                        .on_hover_text(
+                            "Push the memory of every dozing app out of RAM right now, even if RAM isn't low. \
+                             Watch \"RAM available\" (or Task Manager) over the next few seconds to see the real effect.",
+                        )
+                        .clicked()
+                    {
+                        commands.push(Command::ReleaseNow);
+                    }
                     let label = if cfg.paused { "Resume auto-doze" } else { "Pause auto-doze" };
                     if ui.button(label).clicked() {
                         cfg.paused = !cfg.paused;

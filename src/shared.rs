@@ -54,6 +54,8 @@ pub enum Command {
     FreezeNow(String),
     Thaw(String),
     ThawAll,
+    /// Push out the memory of every dozing app now, even if RAM isn't low.
+    ReleaseNow,
     /// Force quit every process of the app.
     Kill(String),
 }
