@@ -12,12 +12,17 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
-use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS};
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetWindow, GetWindowLongW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, WS_EX_TOOLWINDOW,
+use windows::Win32::Foundation::POINT;
+use windows::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
-use windows::core::{BOOL, PCSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GA_ROOT, GW_OWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow, GetWindow,
+    GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SwitchToThisWindow,
+    WS_EX_TOOLWINDOW, WindowFromPoint,
+};
+use windows::core::{BOOL, PCSTR, PWSTR, w};
 
 /// Processes that must never be frozen, even if the user asks.
 /// Freezing any of these can hang the desktop, input, audio or security.
@@ -187,6 +192,7 @@ fn session_of(pid: u32) -> Option<u32> {
 
 #[derive(Clone, Debug)]
 pub struct AppWindow {
+    pub hwnd: isize,
     pub pid: u32,
     pub minimized: bool,
     pub title: String,
@@ -227,6 +233,7 @@ pub fn app_windows() -> HashMap<u32, Vec<AppWindow>> {
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
             out.push(AppWindow {
+                hwnd: hwnd.0 as isize,
                 pid,
                 minimized: IsIconic(hwnd).as_bool(),
                 title: String::from_utf16_lossy(&buf[..n as usize]),
@@ -274,6 +281,64 @@ pub fn pid_for_window(hwnd: HWND) -> Option<u32> {
 
 pub fn foreground_pid() -> Option<u32> {
     pid_for_window(unsafe { GetForegroundWindow() })
+}
+
+pub fn foreground_window() -> HWND {
+    unsafe { GetForegroundWindow() }
+}
+
+pub fn window_class(hwnd: HWND) -> String {
+    let mut class = [0u16; 128];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) };
+    if n > 0 { String::from_utf16_lossy(&class[..n as usize]) } else { String::new() }
+}
+
+/// Lower-case exe name of a process, e.g. "explorer.exe".
+pub fn exe_of_pid(pid: u32) -> Option<String> {
+    let h = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len).ok()? };
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    path.rsplit('\\').next().map(|n| n.to_lowercase())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShellUi {
+    /// The taskbar itself (buttons, tray icons).
+    Taskbar,
+    /// Alt-Tab / Task View.
+    Switcher,
+    /// Other shell pop-ups: taskbar thumbnails, the tray overflow, jump lists.
+    Other,
+}
+
+/// Is this window part of the Windows shell UI (as opposed to a File Explorer
+/// window or the desktop, which also belong to explorer.exe)?
+pub fn shell_ui(hwnd: HWND) -> Option<ShellUi> {
+    if hwnd.is_invalid() {
+        return None;
+    }
+    let pid = window_pid(hwnd)?;
+    if exe_of_pid(pid).as_deref() != Some("explorer.exe") {
+        return None;
+    }
+    match window_class(hwnd).as_str() {
+        "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" => Some(ShellUi::Taskbar),
+        "MultitaskingViewFrame" | "XamlExplorerHostIslandWindow" | "TaskSwitcherWnd" => Some(ShellUi::Switcher),
+        "CabinetWClass" | "ExploreWClass" | "Progman" | "WorkerW" | "#32770" | "OperationStatusWindow" => None,
+        _ => Some(ShellUi::Other),
+    }
+}
+
+/// Top-level window under a screen point.
+pub fn root_window_at(pt: POINT) -> HWND {
+    unsafe { GetAncestor(WindowFromPoint(pt), GA_ROOT) }
+}
+
+/// Restore and bring a window to the front, the way Alt-Tab does.
+pub fn restore_window(hwnd: isize) {
+    unsafe { SwitchToThisWindow(HWND(hwnd as *mut _), true) };
 }
 
 pub fn clipboard_owner_pid() -> Option<u32> {

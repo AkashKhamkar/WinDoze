@@ -1,6 +1,6 @@
 [package]
 name = "windoze"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Freeze the background apps you choose so the one you're using gets the RAM and CPU."
 

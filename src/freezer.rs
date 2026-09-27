@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,16 @@ impl FrozenGroup {
 }
 
 static FROZEN: Mutex<Vec<FrozenGroup>> = Mutex::new(Vec::new());
+/// Lock-free "is anything dozing?" for the mouse hook, which must never block.
+static ANY_FROZEN: AtomicBool = AtomicBool::new(false);
+
+pub fn any_frozen() -> bool {
+    ANY_FROZEN.load(Ordering::Relaxed)
+}
+
+fn update_flag(groups: &[FrozenGroup]) {
+    ANY_FROZEN.store(!groups.is_empty(), Ordering::Relaxed);
+}
 
 fn lock() -> std::sync::MutexGuard<'static, Vec<FrozenGroup>> {
     FROZEN.lock().unwrap_or_else(|e| e.into_inner())
@@ -139,6 +150,7 @@ pub fn freeze_group(exe: &str, pids: &[u32], trim: bool) -> Result<u64, String> 
         saved as f64 / 1_048_576.0
     );
     frozen.push(FrozenGroup { exe: exe.to_string(), procs, since: Instant::now(), saved_bytes: saved });
+    update_flag(&frozen);
     Ok(saved)
 }
 
@@ -157,6 +169,7 @@ pub fn thaw(exe: &str, reason: &str) -> bool {
     };
     let g = frozen.remove(idx);
     resume_group(&g);
+    update_flag(&frozen);
     write_journal(&journal_entries_of(&frozen));
     logln!("woke {exe} ({reason}) after {}s", g.since.elapsed().as_secs());
     true
@@ -168,6 +181,7 @@ pub fn thaw_all(reason: &str) {
         resume_group(&g);
         logln!("woke {} ({reason})", g.exe);
     }
+    update_flag(&frozen);
     write_journal(&[]);
 }
 

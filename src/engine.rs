@@ -3,22 +3,30 @@
 //! loop (needed for the foreground hook), a timer, the panic hotkey, and
 //! WM_QUERYENDSESSION (so nothing stays frozen across logoff/shutdown).
 //! None of this depends on the UI window being visible.
+//!
+//! Waking is the hard part: a dozing app can't respond when you click its
+//! taskbar button or pick it in Alt-Tab, so Windows never brings it to the
+//! front and there's no "it's in front now" event to react to. Instead we
+//! watch for the *intent*: clicks (via a low-level mouse hook), what's under
+//! the mouse on the taskbar and what's selected in Alt-Tab (via UI Automation).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GetMessageW, MSG, PostMessageW,
-    RegisterClassW, SetTimer, TranslateMessage, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_APP, WM_ENDSESSION, WM_HOTKEY, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_SWITCHEND, EVENT_SYSTEM_SWITCHSTART, GetMessageW, KillTimer, MSG,
+    MSLLHOOKSTRUCT, PostMessageW, RegisterClassW, SetTimer, SetWindowsHookExW, TranslateMessage, WH_MOUSE_LL,
+    WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP, WM_ENDSESSION, WM_HOTKEY,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_QUERYENDSESSION, WM_RBUTTONDOWN, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::w;
 
@@ -26,10 +34,23 @@ use crate::config::{Config, Mode, Rule};
 use crate::freezer;
 use crate::logln;
 use crate::shared::{self, AppInfo, Command, RuleState, RuleStatus, Status};
-use crate::win::{self, AppWindow, ProcEntry};
+use crate::uia::Uia;
+use crate::win::{self, AppWindow, ProcEntry, ShellUi};
 
 const WM_WAKE: u32 = WM_APP + 1;
+/// Posted by the mouse hook: wparam = 1 for a left click, lparam = packed screen point.
+const WM_CLICK: u32 = WM_APP + 2;
+const TIMER_TICK: usize = 1;
+const TIMER_SWITCHER: usize = 2;
+const TIMER_FALLBACK: usize = 3;
+const TIMER_RESTORE: usize = 4;
 const TICK_MS: u32 = 1000;
+/// If a taskbar click hasn't opened anything after this long, assume it was
+/// meant for a dozing app we couldn't identify and wake them all.
+const FALLBACK_MS: u32 = 700;
+/// After waking an app because you clicked/picked it, make sure its window
+/// actually came back after this long (the original request may have been lost).
+const RESTORE_CHECK_MS: u32 = 400;
 const HOTKEY_ID: i32 = 1;
 /// "0 minutes" still waits this long, so a quick Alt-Tab never freezes anything.
 const GRACE: Duration = Duration::from_secs(5);
@@ -62,6 +83,45 @@ pub fn start() {
         .name("engine".into())
         .spawn(run)
         .expect("failed to start engine thread");
+    std::thread::Builder::new()
+        .name("mouse-hook".into())
+        .spawn(run_mouse_hook)
+        .expect("failed to start mouse hook thread");
+}
+
+fn engine_hwnd() -> Option<HWND> {
+    let h = ENGINE_HWND.load(Ordering::Acquire);
+    (h != 0).then_some(HWND(h as *mut _))
+}
+
+/// A low-level mouse hook on its own thread. It must return fast (Windows
+/// drops slow hooks, and a slow hook lags the whole mouse), so it only posts
+/// the click position to the engine. It does nothing at all while no app is dozing.
+fn run_mouse_hook() {
+    unsafe extern "system" fn proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        let down = matches!(wparam.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
+        if code >= 0 && down && freezer::any_frozen() {
+            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            let packed = (info.pt.x as u32 as u64) | ((info.pt.y as u32 as u64) << 32);
+            if let Some(engine) = engine_hwnd() {
+                let left = (wparam.0 as u32 == WM_LBUTTONDOWN) as usize;
+                let _ = unsafe { PostMessageW(Some(engine), WM_CLICK, WPARAM(left), LPARAM(packed as isize)) };
+            }
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+    unsafe {
+        let hinstance = GetModuleHandleW(None).unwrap_or_default();
+        if let Err(e) = SetWindowsHookExW(WH_MOUSE_LL, Some(proc), Some(hinstance.into()), 0) {
+            logln!("WARNING: mouse hook failed ({e}); clicking a dozing app won't wake it");
+            return;
+        }
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
 }
 
 fn run() {
@@ -108,10 +168,23 @@ fn run() {
         if hook.is_invalid() {
             logln!("WARNING: foreground hook failed; relying on the 1s poll to wake apps");
         }
+        // Alt-Tab start/end and "window restored".
+        let hook2 = SetWinEventHook(
+            EVENT_SYSTEM_SWITCHSTART,
+            EVENT_SYSTEM_MINIMIZEEND,
+            None,
+            Some(on_win_event),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if hook2.is_invalid() {
+            logln!("WARNING: Alt-Tab hook failed");
+        }
         if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'T' as u32) {
             logln!("WARNING: could not register Ctrl+Alt+Shift+T ({e}); use the tray menu to wake apps");
         }
-        SetTimer(Some(hwnd), 1, TICK_MS, None);
+        SetTimer(Some(hwnd), TIMER_TICK, TICK_MS, None);
 
         ENGINE.with(|e| *e.borrow_mut() = Some(Engine::new()));
         logln!("engine started");
@@ -134,10 +207,32 @@ fn with_engine(f: impl FnOnce(&mut Engine)) {
     });
 }
 
+/// True if no new app window has come to the front since `fg_then`: it's
+/// the same window, nothing, or still the taskbar / Alt-Tab.
+fn nothing_new_in_front(fg_then: isize) -> bool {
+    let fg_now = win::foreground_window();
+    fg_now.is_invalid() || fg_now.0 as isize == fg_then || win::shell_ui(fg_now).is_some()
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_TIMER | WM_WAKE => {
+        WM_TIMER => {
+            match wparam.0 {
+                TIMER_SWITCHER => with_engine(|e| e.poll_switcher()),
+                TIMER_FALLBACK => with_engine(|e| e.fallback_fire()),
+                TIMER_RESTORE => with_engine(|e| e.restore_fire()),
+                _ => with_engine(|e| e.tick()),
+            }
+            LRESULT(0)
+        }
+        WM_WAKE => {
             with_engine(|e| e.tick());
+            LRESULT(0)
+        }
+        WM_CLICK => {
+            let packed = lparam.0 as u64;
+            let pt = POINT { x: packed as u32 as i32, y: (packed >> 32) as u32 as i32 };
+            with_engine(|e| e.on_click(pt, wparam.0 == 1));
             LRESULT(0)
         }
         WM_HOTKEY => {
@@ -174,18 +269,33 @@ unsafe extern "system" fn on_win_event(
     _thread: u32,
     _time: u32,
 ) {
-    if event != EVENT_SYSTEM_FOREGROUND {
-        return;
-    }
-    // Thaw path #1: the user switched to a frozen app (taskbar, Alt-Tab, click).
-    // pid_for_window maps Windows' "ghost" stand-in window back to the frozen app.
-    if let Some(pid) = win::pid_for_window(hwnd)
-        && let Some(exe) = freezer::frozen_exe_for_pid(pid) {
-            freezer::thaw(&exe, "switched to it");
-            with_engine(|e| e.reset_rule(&exe));
-            wake();
-            shared::repaint_ui();
+    match event {
+        EVENT_SYSTEM_FOREGROUND => {
+            let mut handled = false;
+            with_engine(|e| {
+                e.on_foreground(hwnd);
+                handled = true;
+            });
+            // Engine busy (shouldn't happen): still wake the app if it's the one in front.
+            if !handled
+                && let Some(pid) = win::pid_for_window(hwnd)
+                && let Some(exe) = freezer::frozen_exe_for_pid(pid)
+            {
+                freezer::thaw(&exe, "switched to it");
+                wake();
+            }
         }
+        EVENT_SYSTEM_SWITCHSTART => with_engine(|e| e.switcher_begin()),
+        EVENT_SYSTEM_SWITCHEND => with_engine(|e| e.switcher_end()),
+        EVENT_SYSTEM_MINIMIZEEND => {
+            if let Some(pid) = win::pid_for_window(hwnd)
+                && let Some(exe) = freezer::frozen_exe_for_pid(pid)
+            {
+                with_engine(|e| e.wake_app(&exe, "its window was restored", false));
+            }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +316,25 @@ struct Engine {
     ncpu: f64,
     last_apps_scan: Option<Instant>,
     apps_cache: Vec<AppInfo>,
+    uia: Option<Uia>,
+    uia_tried: bool,
+    /// Set while Alt-Tab / Task View is open.
+    switcher: Option<SwitcherState>,
+    /// Foreground window at the time of an unidentified taskbar click.
+    fallback_fg: Option<isize>,
+    /// Last foreground window that was an app (not the taskbar / Alt-Tab).
+    last_app_fg: isize,
+    /// Apps just woken by a click/pick whose windows we should make sure come back.
+    restore_pending: Vec<(String, HashSet<u32>, isize)>,
+}
+
+struct SwitcherState {
+    started: Instant,
+    /// Dozing app currently highlighted in the switcher, if any.
+    candidate: Option<String>,
+    /// Whether UI Automation told us anything at all (if not, it's broken here).
+    saw_names: bool,
+    last_names: Vec<String>,
 }
 
 impl Engine {
@@ -215,6 +344,12 @@ impl Engine {
             ncpu: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64,
             last_apps_scan: None,
             apps_cache: Vec::new(),
+            uia: None,
+            uia_tried: false,
+            switcher: None,
+            fallback_fg: None,
+            last_app_fg: 0,
+            restore_pending: Vec::new(),
         }
     }
 
@@ -226,6 +361,261 @@ impl Engine {
 
     fn reset_all(&mut self) {
         self.rt.values_mut().for_each(|rt| rt.cond_since = None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Waking: working out that the user wants a dozing app back.
+
+    fn uia(&mut self) -> Option<&Uia> {
+        if !self.uia_tried {
+            self.uia_tried = true;
+            self.uia = Uia::new();
+            if self.uia.is_none() {
+                logln!("WARNING: UI Automation unavailable; taskbar/Alt-Tab waking falls back to waking all apps");
+            }
+        }
+        self.uia.as_ref()
+    }
+
+    /// Wake one dozing app. With `restore`, also make sure its window comes
+    /// back to the front, since the click/pick that was meant to do that went
+    /// to an app that couldn't respond.
+    fn wake_app(&mut self, exe: &str, reason: &str, restore: bool) {
+        let pids = freezer::frozen_info().into_iter().find(|f| f.exe == exe).map(|f| f.pids).unwrap_or_default();
+        if !freezer::thaw(exe, reason) {
+            return;
+        }
+        self.reset_rule(exe);
+        if restore && !pids.is_empty() {
+            let fg = win::foreground_window().0 as isize;
+            self.restore_pending.push((exe.to_string(), pids, fg));
+            if let Some(h) = engine_hwnd() {
+                unsafe { SetTimer(Some(h), TIMER_RESTORE, RESTORE_CHECK_MS, None) };
+            }
+        }
+        wake();
+        shared::repaint_ui();
+    }
+
+    fn on_foreground(&mut self, hwnd: HWND) {
+        if let Some(pid) = win::pid_for_window(hwnd)
+            && let Some(exe) = freezer::frozen_exe_for_pid(pid)
+        {
+            self.wake_app(&exe, "switched to it", false);
+        }
+        match win::shell_ui(hwnd) {
+            Some(ShellUi::Switcher) => self.switcher_begin(),
+            Some(_) => {}
+            None => {
+                if self.switcher.is_some() {
+                    self.switcher_end();
+                }
+                self.last_app_fg = hwnd.0 as isize;
+            }
+        }
+    }
+
+    /// A mouse button went down somewhere while at least one app is dozing.
+    fn on_click(&mut self, pt: POINT, left: bool) {
+        let root = win::root_window_at(pt);
+        // Clicked straight on a dozing app's window.
+        if let Some(pid) = win::pid_for_window(root)
+            && let Some(exe) = freezer::frozen_exe_for_pid(pid)
+        {
+            self.wake_app(&exe, "clicked its window", false);
+            return;
+        }
+        // Clicked the taskbar, a thumbnail, the tray, or an item in Alt-Tab / Task View:
+        // which app was it for?
+        if win::shell_ui(root).is_none() {
+            return;
+        }
+        let names = self.uia().map(|u| u.names_at(pt)).unwrap_or_default();
+        match self.match_app(&names) {
+            Some((exe, true)) => {
+                logln!("taskbar click on {names:?} -> {exe}");
+                // A right-click opens the jump list; don't pop the window up for that.
+                self.wake_app(&exe, "clicked it on the taskbar", left);
+            }
+            Some((_, false)) => {} // an app that isn't dozing; Windows handles it
+            None => {
+                // Only an app's taskbar button ("Figma - 1 running window"), or a
+                // click we couldn't read at all, gets the safety net; not Start,
+                // the clock, empty taskbar space, etc.
+                let app_button =
+                    names.is_empty() || names.iter().any(|n| n.to_lowercase().contains("running window"));
+                if app_button {
+                    logln!("taskbar click on {names:?}: no app matched, waiting to see if anything opens");
+                    self.fallback_fg = Some(win::foreground_window().0 as isize);
+                    if let Some(h) = engine_hwnd() {
+                        unsafe { SetTimer(Some(h), TIMER_FALLBACK, FALLBACK_MS, None) };
+                    }
+                }
+            }
+        }
+    }
+
+    fn fallback_fire(&mut self) {
+        if let Some(h) = engine_hwnd() {
+            let _ = unsafe { KillTimer(Some(h), TIMER_FALLBACK) };
+        }
+        let Some(fg_then) = self.fallback_fg.take() else { return };
+        // Nothing new came to the front (still the same window, or still the
+        // taskbar / switcher): the click was most likely for a dozing app we
+        // couldn't identify. Waking everything beats leaving you stuck.
+        if nothing_new_in_front(fg_then) && freezer::any_frozen() {
+            freezer::thaw_all("a click didn't open anything, so it was probably meant for a dozing app");
+            self.reset_all();
+            wake();
+            shared::repaint_ui();
+        }
+    }
+
+    fn switcher_begin(&mut self) {
+        if self.switcher.is_some() || !freezer::any_frozen() {
+            return;
+        }
+        logln!("switcher opened (foreground: {})", win::window_class(win::foreground_window()));
+        self.switcher =
+            Some(SwitcherState { started: Instant::now(), candidate: None, saw_names: false, last_names: Vec::new() });
+        if let Some(h) = engine_hwnd() {
+            unsafe { SetTimer(Some(h), TIMER_SWITCHER, 100, None) };
+        }
+        self.poll_switcher();
+    }
+
+    /// While Alt-Tab / Task View is open, track which window is highlighted.
+    fn poll_switcher(&mut self) {
+        let Some(started) = self.switcher.as_ref().map(|s| s.started) else {
+            self.stop_switcher_timer();
+            return;
+        };
+        if started.elapsed() > Duration::from_secs(60) {
+            self.switcher = None;
+            self.stop_switcher_timer();
+            return;
+        }
+        // Only ask for focus while the switcher itself is in front, never a (possibly dozing) app.
+        if win::shell_ui(win::foreground_window()) != Some(ShellUi::Switcher) {
+            // The switcher has closed without handing focus to an app (e.g. you
+            // picked a dozing one): act on what was highlighted.
+            if self.switcher.as_ref().is_some_and(|s| s.saw_names) {
+                self.switcher_end();
+            }
+            return;
+        }
+        let names = self.uia().map(|u| u.focused_names()).unwrap_or_default();
+        if names.is_empty() {
+            return;
+        }
+        let matched = self.match_app(&names);
+        if let Some(state) = self.switcher.as_mut() {
+            state.saw_names = true;
+            state.last_names = names;
+            state.candidate = match matched {
+                Some((exe, true)) => Some(exe),
+                _ => None,
+            };
+        }
+    }
+
+    fn switcher_end(&mut self) {
+        self.stop_switcher_timer();
+        let Some(state) = self.switcher.take() else { return };
+        logln!(
+            "switcher closed: highlighted {:?} -> {:?} (read names: {})",
+            state.last_names,
+            state.candidate,
+            state.saw_names
+        );
+        // If a different, awake app came to the front, that's what you picked
+        // (the highlight just hadn't caught up); leave the dozing one alone.
+        let fg = win::foreground_window();
+        let picked_other = !fg.is_invalid()
+            && win::shell_ui(fg).is_none()
+            && fg.0 as isize != self.last_app_fg
+            && win::pid_for_window(fg).is_some_and(|p| freezer::frozen_exe_for_pid(p).is_none());
+        if picked_other {
+            return;
+        }
+        if let Some(exe) = state.candidate {
+            self.wake_app(&exe, "picked it in Alt-Tab", true);
+        } else if !state.saw_names && freezer::any_frozen() {
+            // UI Automation told us nothing, so we can't see what was picked. If we
+            // end up back where we started, assume it was a dozing app.
+            self.fallback_fg = Some(self.last_app_fg);
+            if let Some(h) = engine_hwnd() {
+                unsafe { SetTimer(Some(h), TIMER_FALLBACK, FALLBACK_MS, None) };
+            }
+        }
+    }
+
+    fn stop_switcher_timer(&self) {
+        if let Some(h) = engine_hwnd() {
+            let _ = unsafe { KillTimer(Some(h), TIMER_SWITCHER) };
+        }
+    }
+
+    /// After a click/pick woke an app, bring its window back if Windows didn't.
+    fn restore_fire(&mut self) {
+        if let Some(h) = engine_hwnd() {
+            let _ = unsafe { KillTimer(Some(h), TIMER_RESTORE) };
+        }
+        let pending = std::mem::take(&mut self.restore_pending);
+        if pending.is_empty() {
+            return;
+        }
+        let windows = win::app_windows();
+        let fg = win::foreground_pid();
+        for (exe, pids, fg_at_wake) in pending {
+            if fg.is_some_and(|p| pids.contains(&p)) {
+                continue; // it came back by itself
+            }
+            if !nothing_new_in_front(fg_at_wake) {
+                continue; // you've moved on to something else; don't steal focus
+            }
+            let wins: Vec<&AppWindow> = pids.iter().filter_map(|p| windows.get(p)).flatten().collect();
+            let target = wins.iter().find(|w| w.minimized).or(wins.first());
+            if let Some(w) = target {
+                logln!("bringing {exe} to the front");
+                win::restore_window(w.hwnd);
+            }
+        }
+    }
+
+    /// Which app do these taskbar / Alt-Tab names refer to? Matches app names
+    /// ("figma") and window titles; the longest match wins. Returns (exe, is_dozing).
+    fn match_app(&self, names: &[String]) -> Option<(String, bool)> {
+        if names.is_empty() {
+            return None;
+        }
+        let frozen = freezer::frozen_info();
+        let windows = win::app_windows();
+        let stem = |exe: &str| exe.strip_suffix(".exe").unwrap_or(exe).to_lowercase();
+        let mut apps: Vec<(String, bool, Vec<String>)> = frozen
+            .iter()
+            .map(|f| {
+                let mut keys = vec![stem(&f.exe)];
+                keys.extend(f.pids.iter().filter_map(|p| windows.get(p)).flatten().map(|w| w.title.to_lowercase()));
+                (f.exe.clone(), true, keys)
+            })
+            .collect();
+        for app in &self.apps_cache {
+            if !frozen.iter().any(|f| f.exe == app.exe) {
+                apps.push((app.exe.clone(), false, vec![stem(&app.exe), app.title.to_lowercase()]));
+            }
+        }
+        let mut best: Option<(usize, &str, bool)> = None;
+        for name in names.iter().map(|n| n.to_lowercase()) {
+            for (exe, dozing, keys) in &apps {
+                for key in keys.iter().map(|k| k.trim()) {
+                    if key.len() >= 3 && name.contains(key) && best.is_none_or(|b| key.len() > b.0) {
+                        best = Some((key.len(), exe, *dozing));
+                    }
+                }
+            }
+        }
+        best.map(|(_, exe, dozing)| (exe.to_string(), dozing))
     }
 
     fn tick(&mut self) {

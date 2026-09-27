@@ -11,6 +11,7 @@ mod freezer;
 mod log;
 mod shared;
 mod ui;
+mod uia;
 mod watchdog;
 mod win;
 
